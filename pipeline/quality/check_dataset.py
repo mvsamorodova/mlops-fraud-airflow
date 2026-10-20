@@ -13,7 +13,7 @@ from pipeline.settings import REPORTS_DIR, TRAINING_DIR, WINDOW_MONTHS
 def check_frame(frame):
     checks = []
     def add(rule, failed, details=""):
-        checks.append({"rule": rule, "passed": failed == 0, "violations": int(failed), "details": details})
+        checks.append({"rule": rule, "passed": bool(failed == 0), "violations": int(failed), "details": details})
     missing = set(LABELED_COLUMNS) - set(frame.columns)
     add("schema", len(missing), ", ".join(sorted(missing)))
     if missing:

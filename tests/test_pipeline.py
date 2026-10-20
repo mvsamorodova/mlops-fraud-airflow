@@ -56,7 +56,13 @@ def test_quality_rules_and_failed_html(frame, tmp_path, monkeypatch):
     frame.loc[2, "lat"] = 100
     frame.loc[3, "transaction_id"] = frame.loc[4, "transaction_id"]
     frame.loc[5, "transaction_time"] = pd.NaT
-    checks = check_frame(frame)
+    from pipeline.quality import check_dataset as checker
+    monkeypatch.setattr(checker, "REPORTS_DIR", tmp_path)
+    snapshot = tmp_path / "bad.parquet"
+    frame.to_parquet(snapshot)
+    result = checker.check_dataset({"key": "bad", "run_id": "<unsafe>", "snapshot": str(snapshot)})
+    checks = result["checks"]
+    assert (tmp_path / "dq/bad.json").exists()
     failed = {row["rule"] for row in checks if not row["passed"]}
     assert {"finite_nonnegative_amount", "binary_target", "valid_coordinates", "unique_transaction_id", "valid_time"} <= failed
     monkeypatch.setattr(module, "REPORTS_DIR", tmp_path)
