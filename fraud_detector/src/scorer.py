@@ -1,6 +1,5 @@
 import logging
 import os
-import shutil
 import threading
 from pathlib import Path
 
@@ -12,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 THRESHOLD = 0.5
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
-BUNDLED_MODEL = Path(os.getenv("BUNDLED_MODEL_PATH", "/app/models/my_catboost.cbm"))
 
 _lock = threading.Lock()
 _model = None
@@ -24,18 +22,9 @@ def _model_path(version: str) -> Path:
 
 
 def ensure_bootstrap():
-    """Кладёт зашитую модель в общий каталог, пока DAG не опубликует новую."""
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    latest = MODELS_DIR / "latest.txt"
-    if latest.exists() and latest.read_text(encoding="utf-8").strip():
-        return
-    dest = _model_path("initial")
-    if not dest.exists():
-        if not BUNDLED_MODEL.exists():
-            raise FileNotFoundError(f"Нет исходной модели: {BUNDLED_MODEL}")
-        shutil.copyfile(BUNDLED_MODEL, dest)
-        logger.info("Скопирована исходная модель в %s", dest)
-    latest.write_text("initial\n", encoding="utf-8")
+    """Проверяет стартовую модель, созданную data_loader."""
+    if not (MODELS_DIR / "latest.txt").is_file():
+        raise FileNotFoundError("Нет latest.txt: сначала запустите data_loader")
 
 
 def _read_latest_version() -> str:
@@ -62,8 +51,14 @@ def _current_model():
     global _model, _version
     version = _read_latest_version()
     if _model is None or version != _version:
-        _model = _load_model(version)
-        _version = version
+        try:
+            candidate = _load_model(version)
+        except Exception:
+            if _model is None:
+                raise
+            logger.exception("Не удалось загрузить %s, продолжаем на %s", version, _version)
+        else:
+            _model, _version = candidate, version
     return _model, _version
 
 
@@ -77,8 +72,7 @@ def make_pred(dt, source_info="kafka"):
         frame = dt[features].copy()
         for idx in model.get_cat_feature_indices():
             column = features[idx]
-            if not pd.api.types.is_numeric_dtype(frame[column]):
-                frame[column] = frame[column].astype(str)
+            frame[column] = frame[column].astype(str)
         y_proba = model.predict_proba(frame)[:, 1]
 
     submission = pd.DataFrame({

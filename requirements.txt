@@ -1,0 +1,10 @@
+numpy==1.26.4
+pandas==2.1.4
+pyarrow==16.1.0
+scipy==1.14.1
+scikit-learn==1.5.2
+catboost==1.2.8
+psycopg2-binary==2.9.10
+confluent-kafka==2.10.0
+kafka-python==2.2.6
+pytest==8.3.5

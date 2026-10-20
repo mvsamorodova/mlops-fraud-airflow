@@ -1,46 +1,28 @@
-"""Сдвиг трёхмесячного окна обучения на один месяц вперёд."""
+"""Материализация скользящего окна."""
 
-import logging
 from datetime import date
-
+from pathlib import Path
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
-from pipeline.settings import CURRENT_DATASET, PENDING_WINDOW
+from pipeline.artifacts import atomic_parquet
+from pipeline.db import read_frame, transaction
+from pipeline.settings import WINDOW_MONTHS
 
-logger = logging.getLogger(__name__)
 
-
-def slide_training_window(batch_info: dict) -> dict:
-    """Добавляет новый месяц к текущему окну и выбрасывает самый старый.
-
-    Читает current.parquet и parquet батча из batch_info. Новое окно пишет
-    в pending_window.parquet и не заменяет current.parquet: замена происходит
-    только после публикации модели, чтобы повтор задачи не сдвинул окно дважды.
-    Возвращает путь к новому окну и месяц добавленного батча.
-    """
-    if not CURRENT_DATASET.exists():
-        raise FileNotFoundError(f"Нет исходного датасета {CURRENT_DATASET}")
-
-    batch_month = date.fromisoformat(batch_info["batch_month"])
-    current = pd.read_parquet(CURRENT_DATASET)
-    batch = pd.read_parquet(batch_info["batch_path"])
-    current["transaction_time"] = pd.to_datetime(current["transaction_time"])
-    batch["transaction_time"] = pd.to_datetime(batch["transaction_time"])
-
-    combined = pd.concat([current, batch], ignore_index=True)
-    periods = combined["transaction_time"].dt.to_period("M")
-    oldest = periods.min()
-    updated = combined.loc[periods != oldest].sort_values("transaction_time")
-    updated.to_parquet(PENDING_WINDOW, index=False)
-
-    logger.info(
-        "Окно после сдвига: %s строк, %s — %s. Удалён месяц %s.",
-        len(updated),
-        updated["transaction_time"].min(),
-        updated["transaction_time"].max(),
-        oldest,
-    )
-    return {
-        "dataset_path": str(PENDING_WINDOW),
-        "batch_month": batch_month.isoformat(),
-    }
+def slide_training_window(batch_info):
+    """Читает историю и snapshot месяца; пишет фиксированное окно, повтор использует тот же файл."""
+    path = Path(batch_info["work_dir"]) / "window.parquet"
+    if not path.exists():
+        month = date.fromisoformat(batch_info["batch_month"])
+        start = month - relativedelta(months=WINDOW_MONTHS - 1)
+        with transaction() as conn:
+            history = read_frame(conn, start, month)
+        frame = pd.concat([history, pd.read_parquet(batch_info["batch_path"])], ignore_index=True)
+        frame = frame.sort_values(["transaction_time", "transaction_id"])
+        periods = sorted(frame.transaction_time.dt.to_period("M").unique())
+        expected = list(pd.period_range(start, month, freq="M"))
+        if periods != expected:
+            raise ValueError(f"Неполное окно: {periods}, ожидалось {expected}")
+        atomic_parquet(frame, path)
+    return {**batch_info, "dataset_path": str(path)}

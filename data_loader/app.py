@@ -1,255 +1,82 @@
-import io
+"""Начальная загрузка витрины и обучение стартовой модели."""
+
 import logging
 import os
-import time
 from pathlib import Path
 
 import pandas as pd
-import psycopg2
+from dateutil.relativedelta import relativedelta
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("data_loader")
+from fraud_detector.src.preprocessing import run_preproc
+from pipeline.artifacts import atomic_json, atomic_parquet, atomic_text
+from pipeline.data import demo_frame, load_csv
+from pipeline.db import copy_labeled_frame, lock_state, read_frame, read_training_state, transaction
+from pipeline.model import train_model
+from pipeline.settings import CURRENT_DATASET, MODELS_DIR, TRAINING_DIR, WINDOW_MONTHS
 
-CSV_PATH = Path(os.getenv("LABELED_CSV_PATH", "/data/train.csv"))
-TRAINING_DIR = Path(os.getenv("TRAINING_DATA_DIR", "/training_data"))
-CURRENT_DATASET = TRAINING_DIR / "current.parquet"
-
-COLUMNS = [
-    "transaction_time",
-    "merch",
-    "cat_id",
-    "amount",
-    "name_1",
-    "name_2",
-    "gender",
-    "street",
-    "one_city",
-    "us_state",
-    "post_code",
-    "lat",
-    "lon",
-    "population_city",
-    "jobs",
-    "merchant_lat",
-    "merchant_lon",
-    "target",
-]
-
-# Исходное окно обучения: январь–март 2019 включительно.
-INITIAL_WINDOW_START = "2019-01-01"
-INITIAL_WINDOW_END = "2019-03-01"
-INITIAL_NEXT_BATCH = "2019-04-01"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def get_db_config():
-    return {
-        "host": os.getenv("POSTGRES_HOST", "postgres"),
-        "port": os.getenv("POSTGRES_PORT", "5432"),
-        "dbname": os.getenv("POSTGRES_DB"),
-        "user": os.getenv("POSTGRES_USER"),
-        "password": os.getenv("POSTGRES_PASSWORD"),
-    }
-
-
-def connect():
-    config = get_db_config()
-    last_error = None
-    for attempt in range(1, 31):
-        try:
-            return psycopg2.connect(**config)
-        except psycopg2.OperationalError as exc:
-            last_error = exc
-            logger.info("Postgres ещё не готов (%s/30): %s", attempt, exc)
-            time.sleep(2)
-    raise last_error
-
-
-def ensure_schema(conn):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS labeled_transactions (
-                transaction_time TIMESTAMP NOT NULL,
-                merch TEXT,
-                cat_id TEXT,
-                amount DOUBLE PRECISION,
-                name_1 TEXT,
-                name_2 TEXT,
-                gender TEXT,
-                street TEXT,
-                one_city TEXT,
-                us_state TEXT,
-                post_code INTEGER,
-                lat DOUBLE PRECISION,
-                lon DOUBLE PRECISION,
-                population_city INTEGER,
-                jobs TEXT,
-                merchant_lat DOUBLE PRECISION,
-                merchant_lon DOUBLE PRECISION,
-                target SMALLINT
-            );
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS training_state (
-                id INT PRIMARY KEY,
-                window_start DATE NOT NULL,
-                window_end DATE NOT NULL,
-                next_batch_month DATE NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-    conn.commit()
-    logger.info("Схема витрины проверена.")
-
-
-def ensure_time_index(conn):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS labeled_transactions_time_idx
-            ON labeled_transactions (transaction_time);
-            """
-        )
-    conn.commit()
-
-
-def row_count(conn):
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM labeled_transactions")
-        return cur.fetchone()[0]
-
-
-def load_csv():
-    if not CSV_PATH.exists():
-        raise FileNotFoundError(f"Не найден файл размеченных данных: {CSV_PATH}")
-    logger.info("Чтение %s", CSV_PATH)
-    frame = pd.read_csv(CSV_PATH)
-    missing = [column for column in COLUMNS if column not in frame.columns]
-    if missing:
-        raise ValueError(f"В CSV нет колонок: {missing}")
-    frame = frame[COLUMNS].copy()
-    frame["transaction_time"] = pd.to_datetime(frame["transaction_time"])
-    logger.info(
-        "CSV прочитан: %s строк, время с %s по %s",
-        len(frame),
-        frame["transaction_time"].min(),
-        frame["transaction_time"].max(),
-    )
-    return frame
-
-
-def copy_frame(conn, frame):
-    buffer = io.StringIO()
-    frame.to_csv(
-        buffer,
-        index=False,
-        header=False,
-        date_format="%Y-%m-%d %H:%M:%S",
-    )
-    buffer.seek(0)
-    with conn.cursor() as cur:
-        cur.copy_expert(
-            """
-            COPY labeled_transactions (
-                transaction_time, merch, cat_id, amount, name_1, name_2, gender,
-                street, one_city, us_state, post_code, lat, lon, population_city,
-                jobs, merchant_lat, merchant_lon, target
-            )
-            FROM STDIN WITH (FORMAT CSV)
-            """,
-            buffer,
-        )
-    conn.commit()
-    logger.info("В витрину labeled_transactions загружено %s строк.", len(frame))
-
-
-def ensure_state(conn):
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM training_state WHERE id = 1")
-        if cur.fetchone()[0]:
-            logger.info("training_state уже заполнен, указатель месяца не сбрасывается.")
-            return
-        cur.execute(
-            """
-            INSERT INTO training_state (id, window_start, window_end, next_batch_month)
-            VALUES (1, %s, %s, %s)
-            """,
-            (INITIAL_WINDOW_START, INITIAL_WINDOW_END, INITIAL_NEXT_BATCH),
-        )
-    conn.commit()
-    logger.info(
-        "Стартовое окно обучения: %s — %s, первый батч DAG: %s",
-        INITIAL_WINDOW_START,
-        INITIAL_WINDOW_END,
-        INITIAL_NEXT_BATCH,
-    )
-
-
-def read_state(conn):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT window_start, window_end
-            FROM training_state
-            WHERE id = 1
-            """
-        )
-        window_start, window_end = cur.fetchone()
-    return window_start, window_end
-
-
-def materialize_window(conn):
+def initialize_data():
+    """Читает CSV или demo, пишет витрину и стартовое окно; повтор не перезаливает БД."""
+    with transaction() as conn:
+        lock_state(conn)
+        with conn.cursor() as cur:
+            cur.execute(Path("pipeline/schema.sql").read_text())
+            cur.execute("SELECT count(*) FROM training_state")
+            initialized = cur.fetchone()[0]
+        if not initialized:
+            source = os.getenv("DATA_SOURCE", "demo")
+            if source not in {"demo", "csv"}:
+                raise ValueError("DATA_SOURCE должен быть demo или csv")
+            frame = demo_frame() if source == "demo" else load_csv(os.environ["LABELED_CSV_PATH"])
+            from pipeline.quality.check_dataset import check_frame
+            checks = check_frame(frame)
+            failed = [row["rule"] for row in checks if not row["passed"]]
+            if failed:
+                raise ValueError(f"Исходные данные не прошли DQ: {failed}")
+            periods = sorted(frame.transaction_time.dt.to_period("M").unique())
+            if len(periods) < WINDOW_MONTHS or periods != list(pd.period_range(periods[0], periods[-1], freq="M")):
+                raise ValueError("Нужны последовательные месяцы, не меньше WINDOW_MONTHS")
+            start = periods[0].start_time.date()
+            end = start + relativedelta(months=WINDOW_MONTHS - 1)
+            copy_labeled_frame(conn, frame)
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO training_state VALUES (1,%s,%s,%s,CURRENT_TIMESTAMP)",
+                            (start, end, end + relativedelta(months=1)))
+            logger.info("Загружено %s строк, источник=%s", len(frame), source)
+        state = read_training_state(conn)
+        frame = read_frame(conn, state["window_start"], state["window_end"] + relativedelta(months=1))
     TRAINING_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(TRAINING_DIR, 0o777)
-    if CURRENT_DATASET.exists():
-        logger.info("%s уже существует, исходный датасет не перезаписывается.", CURRENT_DATASET)
-        return
+    if not CURRENT_DATASET.exists():
+        atomic_parquet(frame, CURRENT_DATASET)
+    stream_path = TRAINING_DIR / "stream.parquet"
+    if not stream_path.exists():
+        atomic_parquet(frame.sample(n=min(5000, len(frame)), random_state=42).drop(columns=["target"]), stream_path)
+    return frame, state
 
-    window_start, window_end = read_state(conn)
-    end_exclusive = pd.Timestamp(window_end) + pd.DateOffset(months=1)
-    frame = pd.read_sql(
-        """
-        SELECT transaction_time, merch, cat_id, amount, name_1, name_2, gender,
-               street, one_city, us_state, post_code, lat, lon, population_city,
-               jobs, merchant_lat, merchant_lon, target
-        FROM labeled_transactions
-        WHERE transaction_time >= %s AND transaction_time < %s
-        ORDER BY transaction_time
-        """,
-        conn,
-        params=(window_start, end_exclusive.to_pydatetime()),
-    )
-    frame.to_parquet(CURRENT_DATASET, index=False)
-    os.chmod(CURRENT_DATASET, 0o666)
-    logger.info(
-        "Исходный датасет обучения: %s строк, %s — %s, файл %s",
-        len(frame),
-        frame["transaction_time"].min() if len(frame) else None,
-        frame["transaction_time"].max() if len(frame) else None,
-        CURRENT_DATASET,
-    )
+
+def initialize_model(frame, state):
+    """Обучает initial на ранних месяцах; существующий latest.txt не заменяет."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if (MODELS_DIR / "latest.txt").exists():
+        return
+    train = frame.loc[frame.transaction_time < pd.Timestamp(state["window_end"])]
+    model = train_model(run_preproc(train))
+    temp = MODELS_DIR / ".initial.cbm"
+    model.save_model(str(temp))
+    os.replace(temp, MODELS_DIR / "my_catboost_initial.cbm")
+    atomic_json(MODELS_DIR / "my_catboost_initial.metrics.json", {
+        "version": "initial", "train_end": str(train.transaction_time.max()), "source": os.getenv("DATA_SOURCE", "demo"),
+    })
+    atomic_text(MODELS_DIR / "latest.txt", "initial\n")
+    logger.info("Стартовая модель сохранена")
 
 
 def main():
-    conn = connect()
-    try:
-        ensure_schema(conn)
-        if row_count(conn) == 0:
-            copy_frame(conn, load_csv())
-        else:
-            logger.info("Витрина labeled_transactions уже заполнена, повторная загрузка пропущена.")
-        ensure_time_index(conn)
-        ensure_state(conn)
-        materialize_window(conn)
-    finally:
-        conn.close()
-    logger.info("Загрузка витрины завершена.")
+    frame, state = initialize_data()
+    initialize_model(frame, state)
 
 
 if __name__ == "__main__":

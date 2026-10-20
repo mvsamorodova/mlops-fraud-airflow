@@ -1,0 +1,214 @@
+name: fraud-airflow
+
+x-runtime: &runtime
+  image: fraud-airflow-runtime:local
+  build:
+    context: .
+    dockerfile: runtime/Dockerfile
+  networks: [ml-scorer]
+  environment: &runtime-env
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    POSTGRES_DB: fraud_db
+    POSTGRES_USER: fraud_user
+    POSTGRES_PASSWORD: fraud_pass
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_SCORING_TOPIC: scoring
+    MODELS_DIR: /models
+    TRAINING_DATA_DIR: /training_data
+    REPORTS_DIR: /reports
+    WINDOW_MONTHS: ${WINDOW_MONTHS:-3}
+    HISTORY_MONTHS: ${HISTORY_MONTHS:-36}
+    SAMPLE_SIZE: ${SAMPLE_SIZE:-10000}
+    MODEL_ITERATIONS: ${MODEL_ITERATIONS:-100}
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.1
+    networks: [ml-scorer]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    networks: [ml-scorer]
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: [CMD, kafka-topics, --bootstrap-server, kafka:9092, --list]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.7.1
+    networks: [ml-scorer]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scoring --partitions 3 --replication-factor 1
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    networks: [ml-scorer]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports: ["127.0.0.1:8080:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  postgres:
+    image: postgres:15.10
+    networks: [ml-scorer]
+    environment:
+      POSTGRES_DB: fraud_db
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_pass
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U fraud_user -d fraud_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  data_loader:
+    <<: *runtime
+    command: python -m data_loader.app
+    environment:
+      <<: *runtime-env
+      DATA_SOURCE: ${DATA_SOURCE:-demo}
+      LABELED_CSV_PATH: /data/train.csv
+    volumes:
+      - ./data:/data:ro
+      - training_data:/training_data
+      - ./artifacts/models:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  transaction_simulator:
+    <<: *runtime
+    command: python -m transaction_simulator.app
+    environment:
+      <<: *runtime-env
+      TRANSACTIONS_CSV_PATH: /training_data/stream.parquet
+      SEND_INTERVAL_SECONDS: "0.5"
+    volumes: [training_data:/training_data:ro]
+    depends_on:
+      data_loader:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  fraud_detector:
+    <<: *runtime
+    command: python -m fraud_detector.app.app
+    volumes: [./artifacts/models:/models:ro]
+    depends_on:
+      data_loader:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scoring_writer:
+    <<: *runtime
+    command: python -m scoring_writer.app
+    depends_on:
+      data_loader:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow:
+    build: ./airflow
+    user: "0:0"
+    networks: [ml-scorer]
+    environment:
+      <<: *runtime-env
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: ${DAGS_PAUSED:-false}
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow_state/airflow.db
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "10"
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "10"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      AIRFLOW__WEBSERVER__SECRET_KEY: local-homework-secret
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      PYTHONPATH: /opt/airflow
+      MODELS_DIR: /opt/airflow/models
+      TRAINING_DATA_DIR: /opt/airflow/training_data
+      REPORTS_DIR: /opt/airflow/reports
+      DAG_SCHEDULE: ${DAG_SCHEDULE:-*/5 * * * *}
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+      - ./pipeline:/opt/airflow/pipeline:ro
+      - ./scripts:/opt/airflow/scripts:ro
+      - ./fraud_detector:/opt/airflow/fraud_detector:ro
+      - ./artifacts/models:/opt/airflow/models
+      - ./artifacts/reports:/opt/airflow/reports
+      - training_data:/opt/airflow/training_data
+      - airflow_state:/opt/airflow/airflow_state
+    ports: ["127.0.0.1:8081:8080"]
+    depends_on:
+      data_loader:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent http://localhost:8080/health | python -c 'import sys,json; d=json.load(sys.stdin); assert d["scheduler"]["status"] == "healthy"'
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  reports:
+    image: nginx:1.27-alpine
+    networks: [ml-scorer]
+    volumes: [./artifacts/reports:/usr/share/nginx/html:ro]
+    ports: ["127.0.0.1:8082:80"]
+
+  tests:
+    <<: *runtime
+    profiles: [tools]
+    command: python -m pytest -q
+    environment:
+      <<: *runtime-env
+      TEST_POSTGRES: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  ml-scorer:
+    driver: bridge
+
+volumes:
+  zookeeper_data:
+  zookeeper_log:
+  postgres_data:
+  kafka_data:
+  training_data:
+  airflow_state:

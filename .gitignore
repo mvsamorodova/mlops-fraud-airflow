@@ -1,6 +1,12 @@
-.venv
 .env
-*.DS_Store
-*.csv
+.venv/
 __pycache__/
-*.py[cod]
+.pytest_cache/
+*.pyc
+.DS_Store
+/data/*
+!/data/.gitkeep
+/artifacts/*
+!/artifacts/.gitkeep
+/results/*
+!/results/.gitkeep
