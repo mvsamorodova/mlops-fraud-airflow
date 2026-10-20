@@ -145,7 +145,7 @@ docker compose exec postgres psql -U fraud_user -d fraud_db -c \
   "SELECT * FROM training_state;"
 ```
 
-В `artifacts/models/my_catboost_vYYYYMM.metrics.json` находятся метрики обеих моделей и `accepted`. При `accepted=false` прежняя версия в новых скорах ожидаема. На demo первый кандидат (апрель) проходит проверку; майский отклоняется при параметрах по умолчанию.
+В `artifacts/models/my_catboost_vYYYYMM.metrics.json` находятся метрики обеих моделей и `accepted`. При `accepted=false` прежняя версия в новых скорах ожидаема.
 
 Контракт сохранён: вход Kafka `transactions` — объект `transaction_id` и `data`; выход `scoring` — список объектов `transaction_id`, `score`, `fraud_flag`, `model_version`. Таблица результатов — `scores`. Kafka offsets подтверждаются после отправки результата или записи в БД. Повторная доставка в writer дедуплицируется по ID.
 
@@ -158,7 +158,7 @@ docker compose exec airflow python /opt/airflow/scripts/check_dags.py
 
 Тесты проверяют признаки, временной split, границы календарных месяцев, DQ с отрицательными примерами, hot reload, повтор поставки, восстановление после сбоя публикации и отклонение кандидата. Тесты БД создают отдельную временную базу и удаляют её после выполнения.
 
-[GitHub Actions](https://github.com/mvsamorodova/mlops-fraud-airflow/actions) дополнительно поднимает Compose с нуля, запускает все DAG через REST API, проверяет новые скоры и отсутствие перезапуска scorer, затем проверяет плановые запуски. На время CI расписание сокращено до минуты. Логи, метрики, HTML и `smoke.json` доступны в артефакте `verification`.
+[GitHub Actions](https://github.com/mvsamorodova/mlops-fraud-airflow/actions) дополнительно поднимает Compose с нуля, запускает все DAG через REST API, проверяет новые скоры и отсутствие перезапуска scorer, затем проверяет плановые запуски и сохранение состояния после перезапуска стенда. На время CI расписание сокращено до минуты. Логи, метрики, HTML и `smoke.json` доступны в артефакте `verification`.
 
 ## Настройки
 

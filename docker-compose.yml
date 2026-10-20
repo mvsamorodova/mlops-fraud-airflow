@@ -170,6 +170,7 @@ services:
       - ./artifacts/reports:/opt/airflow/reports
       - training_data:/opt/airflow/training_data
       - airflow_state:/opt/airflow/airflow_state
+      - airflow_logs:/opt/airflow/logs
     ports: ["127.0.0.1:8081:8080"]
     depends_on:
       data_loader:
@@ -212,3 +213,4 @@ volumes:
   kafka_data:
   training_data:
   airflow_state:
+  airflow_logs:
