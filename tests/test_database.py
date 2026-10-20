@@ -97,8 +97,21 @@ def test_publish_recovers_after_pointer_write(database, monkeypatch):
 
 def test_rejected_candidate_keeps_production(database):
     from pipeline.retrain.publish_model import publish_model
-    info = candidate("reject")
-    info["accepted"] = False
+    from pipeline.retrain.extract_month_batch import extract_month_batch
+    from pipeline.retrain.slide_training_window import slide_training_window
+    from pipeline.retrain.time_train_test_split import time_train_test_split
+    from pipeline.retrain.preprocess_dataset import preprocess_dataset
+    from pipeline.retrain.fit_catboost import fit_catboost
+    from pipeline.retrain.evaluate_model import evaluate_model
+    from pipeline.model import train_model
+    processed = preprocess_dataset(time_train_test_split(slide_training_window(extract_month_batch("reject"))))
+    corrupted = pd.read_parquet(processed["train_proc_path"])
+    corrupted["target"] = 1 - corrupted["target"]
+    trained = fit_catboost(processed)
+    train_model(corrupted).save_model(trained["model_path"])
+    info = evaluate_model(trained)
+    assert not info["accepted"]
+    assert info["candidate_metrics"]["average_precision"] < info["previous_metrics"]["average_precision"]
     before = (database / "models/latest.txt").read_text()
     publish_model(info)
     assert (database / "models/latest.txt").read_text() == before
@@ -111,3 +124,20 @@ def test_pending_month_is_recovered_by_new_run(database):
     first = extract_month_batch("failed-run")
     second = extract_month_batch("recovery-run")
     assert first == second
+
+
+def test_supply_insert_failure_rolls_back(database):
+    from psycopg2.errors import UniqueViolation
+    from pipeline.supply.sample_next_month import sample_next_month
+    from pipeline.supply.append_labeled_batch import append_labeled_batch
+    batch = sample_next_month("insert-crash")
+    frame = pd.read_parquet(batch["batch_path"])
+    before = query("SELECT count(*) FROM labeled_transactions")[0][0]
+    pd.concat([frame, frame.head(1)]).to_parquet(batch["batch_path"], index=False)
+    with pytest.raises(UniqueViolation):
+        append_labeled_batch(batch)
+    assert query("SELECT count(*) FROM labeled_transactions")[0][0] == before
+    assert query("SELECT status FROM pipeline_runs WHERE kind='supply'")[0][0] == "pending"
+    frame.to_parquet(batch["batch_path"], index=False)
+    append_labeled_batch(batch)
+    assert query("SELECT count(*) FROM labeled_transactions")[0][0] == before + len(frame)

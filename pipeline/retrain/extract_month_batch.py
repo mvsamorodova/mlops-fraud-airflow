@@ -1,6 +1,5 @@
 """Извлечение следующего месяца без изменения указателя."""
 
-import pandas as pd
 from pipeline.artifacts import atomic_parquet
 from pipeline.db import lock_state, month_end_exclusive, read_frame, read_training_state, reserve_month, transaction
 from pipeline.settings import TRAINING_DIR

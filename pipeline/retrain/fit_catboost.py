@@ -1,9 +1,8 @@
 """Обучение и сохранение кандидата."""
 
-from pathlib import Path
 import os
 import pandas as pd
-from pipeline.model import prepare_features, train_model
+from pipeline.model import train_model
 from pipeline.settings import MODELS_DIR
 
 

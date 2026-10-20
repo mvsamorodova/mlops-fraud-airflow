@@ -1,6 +1,5 @@
 """Публикация принятой модели и фиксация обработанного месяца."""
 
-import json
 from datetime import date
 from pathlib import Path
 import pandas as pd

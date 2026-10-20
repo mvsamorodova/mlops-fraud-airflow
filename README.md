@@ -186,7 +186,7 @@ docker compose down
 
 ```bash
 docker compose down -v
-docker compose run --rm --no-deps --user root -v ./artifacts:/artifacts data_loader \
+docker compose run --rm --no-deps --user root -v ./artifacts:/artifacts tests \
   python -c "from pathlib import Path; import shutil; [shutil.rmtree(p) for p in [Path('/artifacts/models'), Path('/artifacts/reports')] if p.exists()]"
 docker compose up -d --build --wait --wait-timeout 600
 ```

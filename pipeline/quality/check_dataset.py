@@ -1,7 +1,6 @@
 """Проверки схемы, значений и покрытия месяцев."""
 
 import hashlib
-from pathlib import Path
 import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
